@@ -153,7 +153,6 @@ jobs:
           if [[ "${{ steps.get_release_tag.outputs.release_tag }}" == "latest" ]]; then
             export BUMP=True
           fi
-          export BUMP=False
           tox -e syft.protocol.check
 
       - name: Set up Docker Buildx
