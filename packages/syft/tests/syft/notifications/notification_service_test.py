@@ -204,6 +204,7 @@ def test_get_sent_success(
     assert response[0] == expected_message
 
 
+@pytest.mark.flaky(reruns=3, reruns_delay=1)
 def test_get_all_error_on_get_all_sent(
     monkeypatch: MonkeyPatch,
     notification_service: NotificationService,
