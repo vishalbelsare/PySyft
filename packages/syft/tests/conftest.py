@@ -1,160 +1,297 @@
 # stdlib
-import logging
-from typing import Any as TypeAny
-from typing import Callable as TypeCallable
-from typing import Dict as TypeDict
-from typing import Generator
-from typing import List as TypeList
+from functools import cache
+import os
+from pathlib import Path
+from secrets import token_hex
+import shutil
+import sys
+from tempfile import gettempdir
+from unittest import mock
+from uuid import uuid4
 
 # third party
-import _pytest
+from faker import Faker
+import numpy as np
 import pytest
 
 # syft absolute
 import syft as sy
-from syft import logger
-from syft.lib import VendorLibraryImportException
-from syft.lib import _load_lib
-from syft.lib import vendor_requirements_available
-
-logger.remove()
-
-
-@pytest.fixture
-def caplog(caplog: _pytest.logging.LogCaptureFixture) -> Generator:
-    class PropogateHandler(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            logging.getLogger(record.name).handle(record)
-
-    logger.add(PropogateHandler())
-    yield caplog
-    logger.remove()
+from syft import Dataset
+from syft.abstract_server import ServerSideType
+from syft.client.datasite_client import DatasiteClient
+from syft.protocol.data_protocol import get_data_protocol
+from syft.protocol.data_protocol import protocol_release_dir
+from syft.protocol.data_protocol import stage_protocol_changes
+from syft.server.worker import Worker
+from syft.service.queue.queue_stash import QueueStash
+from syft.service.user import user
 
 
-def pytest_addoption(parser: _pytest.config.argparsing.Parser) -> None:
-    parser.addoption(
-        "--runslow", action="store_true", default=False, help="run slow tests"
-    )
+def patch_protocol_file(filepath: Path):
+    dp = get_data_protocol()
+    shutil.copyfile(src=dp.file_path, dst=filepath)
 
 
-def pytest_configure(config: _pytest.config.Config) -> None:
-    config.addinivalue_line("markers", "slow: mark test as slow to run")
-    config.addinivalue_line("markers", "fast: mark test as fast to run")
-    config.addinivalue_line("markers", "all: all tests")
-    config.addinivalue_line("markers", "asyncio: mark test as asyncio")
-    config.addinivalue_line("markers", "vendor: mark test as vendor library")
-    config.addinivalue_line("markers", "libs: runs valid vendor tests")
-    config.addinivalue_line("markers", "benchmark: runs benchmark tests")
-    config.addinivalue_line("markers", "torch: runs torch tests")
-    config.addinivalue_line("markers", "grid: runs grid tests")
+def remove_file(filepath: Path):
+    filepath.unlink(missing_ok=True)
 
 
-def pytest_collection_modifyitems(
-    config: _pytest.config.Config, items: TypeList[TypeAny]
-) -> None:
-    # $ pytest -m fast for the fast tests
-    # $ pytest -m slow for the slow tests
-    # $ pytest -m all for all the tests
-    # $ pytest -m libs for the vendor tests
+def pytest_sessionstart(session):
+    # add env var SYFT_TEMP_ROOT to create a unique temp dir for each test run
+    os.environ["SYFT_TEMP_ROOT"] = f"pytest_syft_{token_hex(8)}"
 
-    slow_tests = pytest.mark.slow
-    fast_tests = pytest.mark.fast
-    grid_tests = pytest.mark.grid
-    all_tests = pytest.mark.all
 
-    # dynamically filtered vendor lib tests
-    # there isn't any way to remove "vendor" so the only way to filter
-    # these tests is to add a different tag called "libs" and then run
-    # the tests against that dynamic keyword
-    vendor_tests = pytest.mark.libs  # note libs != vendor
-    loaded_libs: TypeDict[str, bool] = {}
-    vendor_skip = pytest.mark.skip(reason="vendor requirements not met")
+def pytest_configure(config):
+    if hasattr(config, "workerinput") or is_vscode_discover():
+        return
+
+    for path in Path(gettempdir()).glob("pytest_*"):
+        shutil.rmtree(path, ignore_errors=True)
+
+    for path in Path(gettempdir()).glob("sherlock"):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def is_vscode_discover():
+    """Check if the test is being run from VSCode discover test runner."""
+
+    cmd = " ".join(sys.argv)
+    return "ms-python.python" in cmd and "discover" in cmd
+
+
+# Pytest hook to set the number of workers for xdist
+def pytest_xdist_auto_num_workers(config):
+    num = config.option.numprocesses
+    if num == "auto" or num == "logical":
+        return os.cpu_count()
+    return None
+
+
+def pytest_collection_modifyitems(items):
     for item in items:
-        if item.location[0].startswith("PyGrid"):
-            # Ignore if PyGrid folder checked out in main dir
-            continue
-
-        if "grid" in item.keywords:
-            item.add_marker(grid_tests)
-            continue
-        # mark with: pytest.mark.vendor
-        # run with: pytest -m libs -n auto 0
-        if "vendor" in item.keywords:
-            vendor_requirements = item.own_markers[0].kwargs
-
-            # try to load the lib first and if it fails just skip
-            if "lib" in vendor_requirements:
-                lib_name = vendor_requirements["lib"]
-                if lib_name not in loaded_libs:
-                    try:
-                        _load_lib(lib=lib_name)
-                        loaded_libs[lib_name] = True
-                    except Exception as e:
-                        print(f"Failed to load {lib_name}. {e}")
-                        loaded_libs[lib_name] = False
-                if not loaded_libs[lib_name]:
-                    item.add_marker(vendor_skip)
-                    continue
-
-            try:
-                # test the vendor requirements of the specific test if the library
-                # was loaded successfully
-                if vendor_requirements_available(
-                    vendor_requirements=vendor_requirements
-                ):
-                    item.add_marker(vendor_tests)
-                    item.add_marker(all_tests)
-
-            except VendorLibraryImportException as e:
-                print(e)
-            except Exception as e:
-                print(f"Unable to check vendor library: {vendor_requirements}. {e}")
-            continue
-
-        if "benchmark" in item.keywords:
-            continue
-
-        if "torch" in item.keywords:
-            item.add_marker(all_tests)
-            continue
-
-        item.add_marker(all_tests)
-        if "slow" in item.keywords:
-            item.add_marker(slow_tests)
-        else:
-            # fast is the default catch all
-            item.add_marker(fast_tests)
-
-
-@pytest.fixture(scope="session")
-def node() -> sy.VirtualMachine:
-    return sy.VirtualMachine(name="Bob")
+        item_fixtures = getattr(item, "fixturenames", ())
+        if "sqlite_workspace" in item_fixtures:
+            item.add_marker(pytest.mark.xdist_group(name="sqlite"))
 
 
 @pytest.fixture(autouse=True)
-def node_store(node: sy.VirtualMachine) -> None:
-    node.store.clear()
+def protocol_file():
+    random_name = sy.UID().to_string()
+    protocol_dir = sy.SYFT_PATH / "protocol"
+    file_path = protocol_dir / f"{random_name}.json"
+    patch_protocol_file(filepath=file_path)
+    try:
+        yield file_path
+    finally:
+        remove_file(file_path)
 
 
-@pytest.fixture(scope="session")
-def client(node: sy.VirtualMachine) -> sy.VirtualMachineClient:
-    return node.get_client()
+@pytest.fixture(autouse=True)
+def stage_protocol(protocol_file: Path):
+    with mock.patch(
+        "syft.protocol.data_protocol.PROTOCOL_STATE_FILENAME",
+        protocol_file.name,
+    ):
+        dp = get_data_protocol()
+        stage_protocol_changes()
+        # bump_protocol_version()
+        yield dp.protocol_history
+        dp.reset_dev_protocol()
+        dp.save_history(dp.protocol_history)
+
+        # Cleanup release dir, remove unused released files
+        if os.path.exists(protocol_release_dir()):
+            for _file_path in protocol_release_dir().iterdir():
+                for version in dp.read_json(_file_path):
+                    if version not in dp.protocol_history.keys():
+                        _file_path.unlink()
 
 
-@pytest.fixture(scope="session")
-def root_client(node: sy.VirtualMachine) -> sy.VirtualMachineClient:
-    return node.get_root_client()
-
-
-# The unit tests require separate VM's as we have a common crypto store cache.
-# TODO: The  dependency should be modified to use common VM's
 @pytest.fixture
-def get_clients() -> TypeCallable[[int], TypeList[TypeAny]]:
-    def _helper_get_clients(nr_clients: int) -> TypeList[TypeAny]:
-        clients = [
-            sy.VirtualMachine(name=f"P_{i}").get_root_client()
-            for i in range(nr_clients)
-        ]
-        return clients
+def faker():
+    yield Faker()
 
-    return _helper_get_clients
+
+@pytest.fixture(scope="function")
+def worker() -> Worker:
+    """
+    NOTE in-memory sqlite is not shared between connections, so:
+    - using 2 workers (high/low) will not share a db
+    - re-using a connection (e.g. for a Job worker) will not share a db
+    """
+    worker = sy.Worker.named(name=token_hex(16), db_url="sqlite://")
+    yield worker
+    worker.cleanup()
+    del worker
+
+
+@pytest.fixture(scope="function")
+def second_worker() -> Worker:
+    # Used in server syncing tests
+    worker = sy.Worker.named(name=uuid4().hex, db_url="sqlite://")
+    yield worker
+    worker.cleanup()
+    del worker
+
+
+@pytest.fixture(scope="function")
+def high_worker() -> Worker:
+    worker = sy.Worker.named(
+        name=token_hex(8), server_side_type=ServerSideType.HIGH_SIDE, db_url="sqlite://"
+    )
+    yield worker
+    worker.cleanup()
+    del worker
+
+
+@pytest.fixture(scope="function")
+def low_worker() -> Worker:
+    worker = sy.Worker.named(
+        name=token_hex(8),
+        server_side_type=ServerSideType.LOW_SIDE,
+        dev_mode=True,
+        db_url="sqlite://",
+    )
+    yield worker
+    worker.cleanup()
+    del worker
+
+
+@pytest.fixture
+def root_datasite_client(worker) -> DatasiteClient:
+    yield worker.root_client
+
+
+@pytest.fixture
+def root_verify_key(worker):
+    yield worker.root_client.credentials.verify_key
+
+
+@pytest.fixture
+def guest_client(worker) -> DatasiteClient:
+    yield worker.guest_client
+
+
+@pytest.fixture
+def guest_verify_key(worker):
+    yield worker.guest_client.credentials.verify_key
+
+
+@pytest.fixture
+def guest_datasite_client(root_datasite_client) -> DatasiteClient:
+    yield root_datasite_client.guest()
+
+
+@pytest.fixture
+def ds_client(
+    faker: Faker, root_datasite_client: DatasiteClient, guest_client: DatasiteClient
+):
+    guest_email = faker.email()
+    password = "mysecretpassword"
+    root_datasite_client.register(
+        name=faker.name(),
+        email=guest_email,
+        password=password,
+        password_verify=password,
+    )
+    ds_client = guest_client.login(email=guest_email, password=password)
+    yield ds_client
+
+
+@pytest.fixture
+def ds_verify_key(ds_client: DatasiteClient):
+    yield ds_client.credentials.verify_key
+
+
+@pytest.fixture
+def document_store(worker):
+    yield worker.db
+
+
+@pytest.fixture
+def action_store(worker):
+    yield worker.action_store
+
+
+@pytest.fixture(autouse=True)
+def patched_session_cache(monkeypatch):
+    # patching compute heavy hashing to speed up tests
+
+    def _get_key(email, password, connection):
+        return f"{email}{password}{connection}"
+
+    monkeypatch.setattr("syft.client.client.SyftClientSessionCache._get_key", _get_key)
+
+
+cached_salt_and_hash_password = cache(user.salt_and_hash_password)
+cached_check_pwd = cache(user.check_pwd)
+
+
+@pytest.fixture(autouse=True)
+def patched_user(monkeypatch):
+    # patching compute heavy hashing to speed up tests
+
+    monkeypatch.setattr(
+        "syft.service.user.user.salt_and_hash_password",
+        cached_salt_and_hash_password,
+    )
+    monkeypatch.setattr(
+        "syft.service.user.user.check_pwd",
+        cached_check_pwd,
+    )
+
+
+@pytest.fixture
+def small_dataset() -> Dataset:
+    dataset = Dataset(
+        name="small_dataset",
+        asset_list=[
+            sy.Asset(
+                name="small_dataset",
+                data=np.array([1, 2, 3]),
+                mock=np.array([1, 1, 1]),
+            )
+        ],
+    )
+    yield dataset
+
+
+@pytest.fixture
+def big_dataset() -> Dataset:
+    num_elements = 20 * 1024 * 1024
+    data_big = np.random.randint(0, 100, size=num_elements)
+    mock_big = np.random.randint(0, 100, size=num_elements)
+    dataset = Dataset(
+        name="big_dataset",
+        asset_list=[
+            sy.Asset(
+                name="big_dataset",
+                data=data_big,
+                mock=mock_big,
+            )
+        ],
+    )
+    yield dataset
+
+
+@pytest.fixture(
+    scope="function",
+    params=[
+        "tODOsqlite_address",
+        # "TODOpostgres_address", # will be used when we have a postgres CI tests
+    ],
+)
+def queue_stash(request):
+    _ = request.param
+    stash = QueueStash.random()
+    yield stash
+
+
+pytest_plugins = [
+    "tests.syft.users.fixtures",
+    "tests.syft.settings.fixtures",
+    "tests.syft.request.fixtures",
+    "tests.syft.dataset.fixtures",
+    "tests.syft.notifications.fixtures",
+    "tests.syft.serde.fixtures",
+]

@@ -1,55 +1,50 @@
-ARG TYPE=domain
-ARG FRONTEND_DEV
-ARG DISABLE_TELEMETRY=1
-ARG PRODUCTION_DIR=/prod_app
+FROM cgr.dev/chainguard/wolfi-base as base
 
-FROM node:16-alpine as init-stage
-ARG TYPE=domain
-ARG PRODUCTION_DIR
-ARG DISABLE_TELEMETRY
+ARG BACKEND_API_BASE_URL="/api/v2/"
+ENV BACKEND_API_BASE_URL ${BACKEND_API_BASE_URL}
 
-ENV NODE_TYPE $TYPE
-ENV PROD_ROOT $PRODUCTION_DIR
-ENV NEXT_TELEMETRY_DISABLED $DISABLE_TELEMETRY
-ENV NEXT_PUBLIC_API_URL=/api/v1
+RUN apk update && \
+  apk upgrade && \
+  apk add --no-cache nodejs-20 pnpm corepack
+
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
 
 WORKDIR /app
-COPY package.json yarn.lock /app/
-RUN --mount=type=cache,target=/root/.yarn YARN_CACHE_FOLDER=/root/.yarn yarn --frozen-lockfile
+
+RUN corepack enable
+
+COPY .npmrc ./
+COPY package.json ./
+COPY pnpm-lock.yaml ./
+
+FROM base AS dependencies
+
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+
+FROM dependencies as syft-ui-tests
+COPY vite.config.ts ./
+COPY ./tests ./tests
+COPY ./src/ ./src
+
+CMD pnpm test:unit
+
+FROM dependencies as syft-ui-development
+
+ENV SERVER_ENV=development
+
 COPY . .
+CMD pnpm dev
 
-FROM node:16-alpine as grid-ui-development
-ARG TYPE=domain
-ARG DISABLE_TELEMETRY
+FROM dependencies AS builder
 
-ENV NODE_TYPE $TYPE
-ENV NEXT_TELEMETRY_DISABLED $DISABLE_TELEMETRY
-ENV NEXT_PUBLIC_ENVIRONMENT=development
-ENV NEXT_PUBLIC_API_URL=/api/v1
+COPY . .
+RUN pnpm build
 
-WORKDIR /app
-COPY --from=init-stage /app .
-CMD ["/usr/local/bin/node", "--max-old-space-size=4096", "/app/node_modules/.bin/next", "dev", "-p", "80"]
+FROM base AS syft-ui-production
 
-FROM init-stage as build-stage
-WORKDIR $PROD_ROOT
+ENV SERVER_ENV=production
 
-COPY --from=init-stage /app .
-RUN yarn build
-RUN yarn export
-
-FROM nginx:stable-alpine as grid-ui-production
-ARG DISABLE_TELEMETRY
-ARG PRODUCTION_DIR
-
-ENV NEXT_TELEMETRY_DISABLED $DISABLE_TELEMETRY
-ENV PROD_ROOT $PRODUCTION_DIR
-ENV NEXT_PUBLIC_ENVIRONMENT=production
-ENV NEXT_PUBLIC_API_URL=/api/v1
-
-COPY --from=build-stage $PROD_ROOT/out /usr/share/nginx/html
-COPY --from=build-stage $PROD_ROOT/docker/nginx.conf /etc/nginx/conf.d/default.conf
-COPY --from=build-stage $PROD_ROOT/docker/nginx-backend-not-found.conf /etc/nginx/extra-conf.d/backend-not-found
-COPY --from=build-stage $PROD_ROOT /hauuuh
-
-
+COPY --from=dependencies /app/node_modules ./node_modules
+COPY --from=builder /app ./
+CMD pnpm preview
